@@ -3,12 +3,13 @@ from __future__ import absolute_import, print_function, unicode_literals
 
 import logging
 import sys
+import tornado.gen as gen
 from collections import defaultdict
 
 from six import iteritems, itervalues, string_types, reraise
 from six.moves import range
 
-from .component import Component, Tuple
+from .component import Component, AsyncComponent, Tuple
 
 
 log = logging.getLogger(__name__)
@@ -411,3 +412,132 @@ class BatchingBolt(Bolt):
             for batch in itervalues(self._batches):
                 for tup in batch:
                     self.fail(tup)
+
+class AsyncBolt(AsyncComponent):
+
+    @gen.coroutine
+    def emit(self, tup, stream=None, anchors=None, direct_task=None,
+             need_task_ids=True):
+        """Emit a new tuple to a stream.
+
+        :param tup: the Tuple payload to send to Storm, should contain only
+                    JSON-serializable data.
+        :type tup: :class:`list` or :class:`streamparse.storm.component.Tuple`
+        :param stream: the ID of the stream to emit this tuple to. Specify
+                       ``None`` to emit to default stream.
+        :type stream: str
+        :param anchors: IDs the tuples (or :class:`streamparse.storm.component.Tuple`
+                        instances) which the emitted tuples should be anchored
+                        to. If ``auto_anchor`` is set to ``True`` and
+                        you have not specified ``anchors``, ``anchors`` will be
+                        set to the incoming/most recent tuple ID(s).
+        :type anchors: list
+        :param direct_task: the task to send the tuple to.
+        :type direct_task: int
+        :param need_task_ids: indicate whether or not you'd like the task IDs
+                              the tuple was emitted (default: ``True``).
+        :type need_task_ids: bool
+
+        :returns: a ``list`` of task IDs that the tuple was sent to. Note that
+                  when specifying direct_task, this will be equal to
+                  ``[direct_task]``. If you specify ``need_task_ids=False``,
+                  this function will return ``None``.
+        """
+        self.log('fdsafsdfasd ')
+        if anchors is None:
+            anchors = self._current_tups if self.auto_anchor else []
+        anchors = [a.id if isinstance(a, Tuple) else a for a in anchors]
+
+        f = yield super(Bolt, self).emit(tup, stream=stream, anchors=anchors,
+                                      direct_task=direct_task,
+                                      need_task_ids=need_task_ids)
+        raise gen.Return(f)
+
+    def emit_many(self, tuples, stream=None, anchors=None, direct_task=None,
+                  need_task_ids=True):
+        """Emit multiple tuples.
+
+        :param tuples: a ``list`` of multiple tuple payloads to send to
+                       Storm. All tuples should contain only
+                       JSON-serializable data.
+        :type tuples: list
+        :param stream: the ID of the steram to emit these tuples to. Specify
+                       ``None`` to emit to default stream.
+        :type stream: str
+        :param anchors: IDs the tuples (or :class:`streamparse.storm.component.Tuple`
+                        instances) which the emitted tuples should be anchored
+                        to. If ``auto_anchor`` is set to ``True`` and
+                        you have not specified ``anchors``, ``anchors`` will be
+                        set to the incoming/most recent tuple ID(s).
+        :type anchors: list
+        :param direct_task: indicates the task to send the tuple to.
+        :type direct_task: int
+        :param need_task_ids: indicate whether or not you'd like the task IDs
+                              the tuple was emitted (default:
+                              ``True``).
+        :type need_task_ids: bool
+
+        .. deprecated:: 1.2.0
+            Just call :py:meth:`Bolt.emit` repeatedly instead.
+        """
+        if not isinstance(tuples, (list, tuple)):
+            raise TypeError('tuples should be a list of lists/tuples, '
+                            'received {!r} instead.'.format(type(tuples)))
+
+        all_task_ids = []
+        for tup in tuples:
+            tid = yield self.emit(
+                tup,
+                stream        = stream,
+                anchors       = anchors,
+                direct_task   = direct_task,
+                need_task_ids = need_task_ids
+            )
+            all_task_ids.append(tid)
+
+        raise gen.Return(all_task_ids)
+
+    @gen.coroutine
+    def ack(self, tup):
+        """Indicate that processing of a tuple has succeeded.
+
+        :param tup: the tuple to acknowledge.
+        :type tup: :class:`str` or :class:`streamparse.storm.component.Tuple`
+        """
+        tup_id = tup.id if isinstance(tup, Tuple) else tup
+        yield self.send_message({'command': 'ack', 'id': tup_id})
+
+    @gen.coroutine
+    def fail(self, tup):
+        """Indicate that processing of a tuple has failed.
+
+        :param tup: the tuple to fail (its ``id`` if ``str``).
+        :type tup: :class:`str` or :class:`streamparse.storm.component.Tuple`
+        """
+        tup_id = tup.id if isinstance(tup, Tuple) else tup
+        yield self.send_message({'command': 'fail', 'id': tup_id})
+
+    @gen.coroutine
+    def _run(self):
+        """The inside of ``run``'s infinite loop.
+
+        Separated out so it can be properly unit tested.
+        """
+        self.log('running in _run')
+        tup = yield self.read_tuple()
+        self._current_tups = [tup]
+        tup = self._current_tups[0]
+        if tup.task == -1 and tup.stream == '__heartbeat':
+            yield self.send_message({'command': 'sync'})
+        elif tup.component == '__system' and tup.stream == '__tick':
+            yield self.process_tick(tup)
+            if self.auto_ack:
+                 yield self.ack(tup)
+        else:
+            yield self.process(tup)
+            if self.auto_ack:
+                 yield self.ack(tup)
+        # reset so that we don't accidentally fail the wrong tuples
+        # if a successive call to read_tuple fails
+        self._current_tups = []
+

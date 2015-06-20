@@ -5,6 +5,9 @@ import io
 import logging
 import os
 import sys
+import tornado.ioloop
+import tornado.gen as gen
+import tornado.queues as queues
 from collections import deque, namedtuple
 from logging.handlers import RotatingFileHandler
 from os.path import join
@@ -472,3 +475,263 @@ class Component(object):
         log.error(log_msg, exc_info=True)
         self.raise_exception(exc)
 
+
+class AsyncComponent(Component):
+    def __init__(self, input_stream=sys.stdin, output_stream=sys.stdout):
+        self.input_stream = input_stream
+        self.output_stream = output_stream
+        self.topology_name = None
+        self.task_id = None
+        self.component_name = None
+        self.debug = None
+        self.storm_conf = None
+        self.context = None
+        self.pid = os.getpid()
+        self.logger = None
+        # pending commands/tuples we read while trying to read task IDs
+        self._pending_commands = queues.Queue()
+        # pending task IDs we read while trying to read commands/tuples
+        self._pending_task_ids = queues.Queue()
+        self.ioloop = tornado.ioloop.IOLoop.current()
+
+    @gen.coroutine
+    def _setup_component(self, storm_conf, context):
+        """Add helpful instance variables to component after initial handshake
+        with Storm.  Also configure logging.
+        """
+        self.topology_name = storm_conf.get('topology.name', '')
+        self.task_id = context.get('taskid', '')
+        self.component_name = context.get('task->component', {})\
+                                      .get(str(self.task_id), '')
+        self.debug = storm_conf.get("topology.debug", False)
+        self.storm_conf = storm_conf
+        self.context = context
+        self.logger = logging.getLogger('.'.join((__name__,
+                                                  self.component_name)))
+        # Set up logging
+        log_path = self.storm_conf.get('streamparse.log.path')
+        if log_path:
+            root_log = logging.getLogger()
+            max_bytes = self.storm_conf.get('streamparse.log.max_bytes',
+                                            1000000)  # 1 MB
+            backup_count = self.storm_conf.get('streamparse.log.backup_count',
+                                               10)
+            log_file = join(log_path,
+                            ('streamparse_{topology_name}_{component_name}'
+                             '_{task_id}_{pid}.log'
+                             .format(topology_name=self.topology_name,
+                                     component_name=self.component_name,
+                                     task_id=self.task_id,
+                                     pid=self.pid)))
+            handler = RotatingFileHandler(log_file, maxBytes=max_bytes,
+                                          backupCount=backup_count)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - '
+                                          '%(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            root_log.addHandler(handler)
+            log_level = self.storm_conf.get('streamparse.log.level', 'info')
+            log_level = _PYTHON_LOG_LEVELS.get(log_level, logging.INFO)
+            if self.debug:
+                # potentially override logging that was provided if
+                # topology.debug was set to true
+                log_level = logging.DEBUG
+            root_log.setLevel(log_level)
+        else:
+            yield self.send_message({'command': 'log',
+                               'msg': ('WARNING: streamparse logging is not '
+                                       'configured. Please set streamparse.log.'
+                                       'path in your config.json.')})
+        # Redirect stdout to ensure that print statements/functions
+        # won't disrupt the multilang protocol
+        sys.stdout = LogStream(logging.getLogger('streamparse.stdout'))
+
+    @gen.coroutine
+    def _setup(self):
+        try:
+            self.log('{0}'.format(dir(self)), level='error')
+        except:
+            pass
+        storm_conf, context = yield self.read_handshake()
+        setup = yield self._setup_component(storm_conf, context)
+        self.initialize(storm_conf, context)
+
+    def run(self):
+        # setup input handler
+        self.ioloop.add_handler(
+            self.input_stream.fileno(),
+            self.read_message,
+            self.ioloop.READ
+        )
+        run = tornado.ioloop.PeriodicCallback(self._run, 10)
+        run.start()
+        self.ioloop.spawn_callback(self._setup)
+        log.error('starting ioloop')
+        self.ioloop.start()
+
+
+    @gen.coroutine
+    def read_message(self):
+        """Read a message from Storm, reconstruct newlines appropriately.
+
+        All of Storm's messages (for either Bolts or Spouts) should be of the
+        form::
+
+            '<command or task_id form prior emit>\\nend\\n'
+
+        Command example, an incoming tuple to a bolt::
+
+            '{ "id": "-6955786537413359385",  "comp": "1", "stream": "1", "task": 9, "tuple": ["snow white and the seven dwarfs", "field2", 3]}\\nend\\n'
+
+        Command example for a Spout to emit it's next tuple::
+
+            '{"command": "next"}\\nend\\n'
+
+        Example, the task IDs a prior emit was sent to::
+
+            '[12, 22, 24]\\nend\\n'
+
+        The edge case of where we read ``''`` from ``input_stream`` indicating
+        EOF, usually means that communication with the supervisor has been
+        severed.
+        """
+        log.error('reading from storm .. fsad')
+        msg = ""
+        num_blank_lines = 0
+        while True:
+            # readline will return trailing \n so that output is unambigious, we
+            # should only have line == '' if we're at EOF
+            line = self.input_stream.readline()
+            if line == 'end\n':
+                break
+            elif line == '':
+                log.error("Received EOF while trying to read stdin from Storm, "
+                           "pipe appears to be broken, exiting.")
+                sys.exit(1)
+            elif line == '\n':
+                num_blank_lines += 1
+                if num_blank_lines % 1000 == 0:
+                    log.warn("While trying to read a command or pending task "
+                             "ID, Storm has instead sent %s '\\n' messages.",
+                             num_blank_lines)
+                continue
+
+            msg = '{}{}\n'.format(msg, line[0:-1])
+
+        try:
+            raise gen.Return(json.loads(msg))
+        except Exception:
+            log.error("JSON decode error for message: %r", msg, exc_info=True)
+
+    @gen.coroutine
+    def send_message(self, message, callback=None):
+        """Send a message to Storm via stdout."""
+        if not isinstance(message, dict):
+            log.error("%s.%d attempted to send a non dict message to Storm: %r",
+                       self.component_name, self.pid, message)
+            return
+
+        wrapped_msg = "{}\nend\n".format(json.dumps(message)).encode('utf-8')
+
+        self.output_stream.write(wrapped_msg)
+
+    @gen.coroutine
+    def emit(self, tup, tup_id=None, stream=None, anchors=None,
+             direct_task=None, need_task_ids=True):
+        """Emit a new tuple to a stream.
+
+        :param tup: the Tuple payload to send to Storm, should contain only
+                    JSON-serializable data.
+        :type tup: :class:`list` or :class:`streamparse.storm.component.Tuple`
+        :param tup_id: the ID for the tuple. If omitted by a
+                       :class:`streamparse.storm.spout.Spout`, this emit will be
+                       unreliable.
+        :type tup_id: str
+        :param stream: the ID of the stream to emit this tuple to. Specify
+                       ``None`` to emit to default stream.
+        :type stream: str
+        :param anchors: IDs the tuples (or :class:`streamparse.storm.component.Tuple`
+                        instances) which the emitted tuples should be anchored
+                        to. If ``auto_anchor`` is set to ``True`` and
+                        you have not specified ``anchors``, ``anchors`` will be
+                        set to the incoming/most recent tuple ID(s).  This is
+                        only passed by :class:`streamparse.storm.bolt.Bolt`.
+        :type anchors: list
+        :param direct_task: the task to send the tuple to.
+        :type direct_task: int
+        :param need_task_ids: indicate whether or not you'd like the task IDs
+                              the tuple was emitted (default: ``True``).
+        :type need_task_ids: bool
+
+        :returns: a ``list`` of task IDs that the tuple was sent to. Note that
+                  when specifying direct_task, this will be equal to
+                  ``[direct_task]``. If you specify ``need_task_ids=False``,
+                  this function will return ``None``.
+        """
+        if not isinstance(tup, (list, tuple)):
+            raise TypeError('All tuples must be either lists or tuples, '
+                            'received {!r} instead.'.format(type(tup)))
+
+        msg = {'command': 'emit', 'tuple': tup}
+
+        if anchors is not None:
+            msg['anchors'] = anchors
+        if tup_id is not None:
+            msg['id'] = tup_id
+        if stream is not None:
+            msg['stream'] = stream
+        if direct_task is not None:
+            msg['task'] = direct_task
+
+        if not need_task_ids:
+            # only need to send on False, Storm's default is True
+            msg['need_task_ids'] = need_task_ids
+
+        # Message encoding will convert both list and tuple to a JSON array.
+        self.send_message(msg)
+
+        if need_task_ids:
+            downstream_task_ids = [direct_task] if direct_task is not None \
+                                  else self.read_task_ids()
+            raise gen.Return(downstream_task_ids)
+        else:
+            raise gen.Return(None)
+
+    @gen.coroutine
+    def read_task_ids(self):
+        if len(self._pending_task_ids.qsize()):
+            raise gen.Return(self._pending_task_ids.get())
+        else:
+            msg = yield self.read_message()
+            while not isinstance(msg, list):
+                yield self._pending_commands.put(msg)
+                msg = yield self.read_message()
+            raise gen.Return(msg)
+
+    @gen.coroutine
+    def read_command(self):
+        if len(self._pending_commands.qsize()):
+            raise gen.Return(self._pending_commands.get())
+        else:
+            msg = yield self.read_message()
+            while isinstance(msg, list):
+                yield self._pending_task_ids.put(msg)
+                msg = yield self.read_message()
+            raise gen.Return(msg)
+
+    @gen.coroutine
+    def read_tuple(self):
+        cmd = yield self.read_command()
+        raise gen.Return(Tuple(cmd['id'], cmd['comp'], cmd['stream'], cmd['task'],
+                     cmd['tuple']))
+
+    @gen.coroutine
+    def read_handshake(self):
+        """Read and process an initial handshake message from Storm."""
+        msg = yield self.read_message()
+        pid_dir, _conf, _context = msg['pidDir'], msg['conf'], msg['context']
+
+        # Write a blank PID file out to the pidDir
+        open(join(pid_dir, str(self.pid)), 'w').close()
+        yield self.send_message({'pid': self.pid})
+
+        raise gen.Return((_conf, _context))
